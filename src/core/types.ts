@@ -155,6 +155,54 @@ export interface TrialResult {
   baselineCount: number;
 }
 
+/**
+ * 检修替换预演中被摘除的在役链路。它在结果中恒标记为“已移除”：
+ * 即使它原本是基线桥，也**不算作被临时备纤消除的风险**。
+ */
+export interface RemovedMaintenanceLink {
+  /** 被摘除链路的原始编号（按导入 ID 逐字符精确匹配） */
+  id: string;
+  u: string;
+  v: string;
+  /** 该链路在原基线中是否为桥（诊断信息；摘除后不参与余网桥分类） */
+  wasBaselineBridge: boolean;
+}
+
+/** 检修替换预演中试接的临时备纤（内部临时链路，不持有导入 ID） */
+export interface TemporaryBackupFiber {
+  a: string;
+  b: string;
+  /** 临时备纤在替换后网络中是否为桥（即新的单点故障） */
+  isBridge: boolean;
+  /** 为桥时，断开后两个连通块中较小者的站点数；非桥时为 0 */
+  smallerSide: number;
+}
+
+/**
+ * 检修替换预演结果：按原始链路 ID 精确摘除一条在役链路，再在两个现有且
+ * 不同的站点之间试接一条临时备纤。**仅当替换后网络连通时才生成**；
+ * 被摘除链路标记“已移除”且不算被备纤消除，平行链路保持各自原始 ID 身份，
+ * 临时备纤的桥属性单独给出。所有清单按链路编号 UTF-8 字节序排列。
+ */
+export interface MaintenanceRehearsalResult {
+  /** 被摘除的在役链路（状态恒为“已移除”） */
+  removedLink: RemovedMaintenanceLink;
+  /** 试接的临时备纤，以及它是否成为新单点（桥） */
+  temporaryFiber: TemporaryBackupFiber;
+  /** 替换后仍为桥的原链路（基线桥中未被摘除、仍为桥者） */
+  stillBridges: BridgeInfo[];
+  /** 替换后新变成桥的原链路（原基线非桥，摘除他线后成为桥者；平行边各按自身 ID 判定） */
+  newBridges: BridgeInfo[];
+  /** 相对基线被临时备纤消除的原桥（基线桥中未被摘除、替换后不再为桥者；被摘除链路不在其内） */
+  clearedBridges: BridgeInfo[];
+  /** 站点数（站点集合不变） */
+  siteCount: number;
+  /** 摘除一条、未计入临时备纤的原链路存活数（= 原链路数 − 1） */
+  survivingLinkCount: number;
+  /** 原基线脆弱链路总数（快照） */
+  baselineCount: number;
+}
+
 /** 解析/分析失败时抛出的错误，消息可直接展示给工程师 */
 export class TopologyError extends Error {
   constructor(message: string) {

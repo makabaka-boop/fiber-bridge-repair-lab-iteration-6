@@ -13,7 +13,7 @@
  * Tarjan；试接在其结果上以独立缓冲派生，绝不改写基线。
  */
 import { compareUtf8 } from './utf8';
-import { MAX_BATCH_PAIRS, MAX_PLAN_STEPS, MAX_QUOTE_CANDIDATES } from './parse';
+import { MAX_BATCH_PAIRS, MAX_PLAN_STEPS, MAX_QUOTE_CANDIDATES, normalizePairEndpoint } from './parse';
 import { TopologyError } from './types';
 import type {
   BaselineResult,
@@ -22,27 +22,38 @@ import type {
   BatchScreenResult,
   BridgeCoverageItem,
   BridgeInfo,
+  MaintenanceRehearsalResult,
   NormalizedTopology,
   OrderedPlanItem,
   OrderedPlanResult,
   OrderedPlanStep,
   QuoteCandidate,
   QuotePlanResult,
+  RemovedMaintenanceLink,
+  TemporaryBackupFiber,
   TrialResult,
 } from './types';
 
-interface PreparedGraph {
+/**
+ * Tarjan 桥检测所需的最小只读图视图。生产基线使用紧凑类型化数组的
+ * PreparedGraph；检修替换预演则用一次性、生命周期隔离的临时图实现同一接口，
+ * 从而核心桥检测代码只写一份（“复用现有桥检测”）。
+ */
+interface BridgeGraph {
   n: number;
-  siteIndex: Map<string, number>;
-  linkIdByIndex: string[];
-  links: NormalizedTopology['links'];
-  /** 每个顶点两条平行的类型化邻接数组：端点下标 / 链路下标 */
   adjTo: Int32Array[];
   adjEdge: Int32Array[];
-  /** DFS 树：父顶点、所用链路下标（根为 -1）、深度 */
   parentVertex: Int32Array;
   parentEdge: Int32Array;
   depth: Int32Array;
+}
+
+interface PreparedGraph extends BridgeGraph {
+  siteIndex: Map<string, number>;
+  /** 链路编号 → 导入下标（逐字符精确匹配） */
+  linkIndex: Map<string, number>;
+  linkIdByIndex: string[];
+  links: NormalizedTopology['links'];
 }
 
 interface TarjanOutput {
@@ -60,8 +71,11 @@ function prepare(t: NormalizedTopology): PreparedGraph {
   for (let i = 0; i < n; i++) siteIndex.set(t.sites[i], i);
 
   const m = t.links.length;
+  const linkIndex = new Map<string, number>();
   const degree = new Int32Array(n);
-  for (const l of t.links) {
+  for (let e = 0; e < m; e++) {
+    const l = t.links[e];
+    linkIndex.set(l.id, e);
     degree[siteIndex.get(l.u)!]++;
     degree[siteIndex.get(l.v)!]++;
   }
@@ -89,6 +103,7 @@ function prepare(t: NormalizedTopology): PreparedGraph {
   return {
     n,
     siteIndex,
+    linkIndex,
     linkIdByIndex,
     links: t.links,
     adjTo,
@@ -100,7 +115,7 @@ function prepare(t: NormalizedTopology): PreparedGraph {
 }
 
 /** 迭代式 Tarjan。图已由解析层保证连通，仍对多分量做防御性遍历。 */
-function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
+function tarjanBridges(g: BridgeGraph, m: number): TarjanOutput {
   const { n, adjTo, adjEdge, parentVertex, parentEdge, depth } = g;
   const disc = new Int32Array(n).fill(-1);
   const low = new Int32Array(n);
@@ -338,6 +353,186 @@ export class Analyzer {
     removed.sort((p, q) => compareUtf8(p.id, q.id));
 
     return { a, b, stillFragile, removed, baselineCount: this.baseline.bridges.length };
+  }
+
+  /**
+   * 检修替换预演：按**原始链路 ID 精确摘除**一条在役链路，再在两个现有且
+   * 不同的站点之间**试接一条临时备纤**，核对余网是否恢复连通，并定位新的
+   * 单点故障（桥）。
+   *
+   *  - 非法输入（链路 ID 为空 / 不存在、端点为空 / 不存在、两端相同）或
+   *    替换后网络不连通：抛 TopologyError，**不产生任何结果**，由调用方
+   *    保留上次成功预演；
+   *  - 成功时返回 MaintenanceRehearsalResult：仍为桥的原链路、新变成桥的
+   *    原链路、被临时备纤消除的原桥，并**单独**说明临时备纤是否为桥；
+   *  - 被摘除链路恒标记“已移除”，**不算作被备纤消除的风险**（它原本是桥
+   *    也不进入 clearedBridges）；平行链路保持各自 ID 身份；
+   *  - 临时备纤的内部边下标固定取 `m`（存活原链路下标之外），绝不与导入
+   *    编号 / 下标碰撞。
+   *
+   * 临时图为本次预演独立构建（独立邻接表与 DFS 缓冲），方法返回后即可被
+   * 回收，与基线 PreparedGraph 完全隔离；核心分析复用同一份迭代式 Tarjan
+   * （经最小只读图视图 BridgeGraph），**不改写原拓扑、基线、单次试接、
+   * 批量筛选、有序计划与报价结果**。
+   */
+  rehearseReplacement(rawLinkId: unknown, rawA: unknown, rawB: unknown): MaintenanceRehearsalResult {
+    const linkId = normalizePairEndpoint(rawLinkId, '检修替换预演：被摘除链路编号');
+    const skip = this.g.linkIndex.get(linkId);
+    if (skip === undefined) {
+      throw new TopologyError(`检修替换预演失败：链路 ${JSON.stringify(linkId)} 不在当前链路清单中`);
+    }
+    const a = normalizePairEndpoint(rawA, '检修替换预演：临时备纤端点 A');
+    const b = normalizePairEndpoint(rawB, '检修替换预演：临时备纤端点 B');
+    if (a === b) {
+      throw new TopologyError(
+        `检修替换预演失败：两个端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`,
+      );
+    }
+    const ia = this.g.siteIndex.get(a);
+    const ib = this.g.siteIndex.get(b);
+    if (ia === undefined || ib === undefined) {
+      const missing = ia === undefined ? a : b;
+      throw new TopologyError(`检修替换预演失败：端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
+    }
+
+    const { links } = this.t;
+    const n = this.g.n;
+    const m = links.length;
+    // 临时图顶点集不变；原链路除被摘除者外全部保留，平行边各自独立。
+    // 临时备纤内部边下标固定为 m，存活原链路下标沿用导入下标（0..m-1），
+    // 被摘除下标 skip 在邻接构建时跳过——两套编号天然不碰撞。
+    const tempEdge = m;
+    const degree = new Int32Array(n);
+    for (let e = 0; e < m; e++) {
+      if (e === skip) continue;
+      const l = links[e];
+      degree[this.g.siteIndex.get(l.u)!]++;
+      degree[this.g.siteIndex.get(l.v)!]++;
+    }
+    degree[ia]++;
+    degree[ib]++;
+
+    const adjTo: Int32Array[] = new Array(n);
+    const adjEdge: Int32Array[] = new Array(n);
+    for (let v = 0; v < n; v++) {
+      adjTo[v] = new Int32Array(degree[v]);
+      adjEdge[v] = new Int32Array(degree[v]);
+    }
+    const cursor = new Int32Array(n);
+    for (let e = 0; e < m; e++) {
+      if (e === skip) continue;
+      const l = links[e];
+      const x = this.g.siteIndex.get(l.u)!;
+      const y = this.g.siteIndex.get(l.v)!;
+      adjTo[x][cursor[x]] = y;
+      adjEdge[x][cursor[x]] = e;
+      cursor[x]++;
+      adjTo[y][cursor[y]] = x;
+      adjEdge[y][cursor[y]] = e;
+      cursor[y]++;
+    }
+    adjTo[ia][cursor[ia]] = ib;
+    adjEdge[ia][cursor[ia]] = tempEdge;
+    cursor[ia]++;
+    adjTo[ib][cursor[ib]] = ia;
+    adjEdge[ib][cursor[ib]] = tempEdge;
+    cursor[ib]++;
+
+    // 连通性（显式队列 BFS）：替换后不连通则拒绝，不生成任何预演结果
+    const seen = new Uint8Array(n);
+    const queue = new Int32Array(n);
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = 0;
+    seen[0] = 1;
+    while (head < tail) {
+      const v = queue[head++];
+      const nb = adjTo[v];
+      for (let k = 0; k < nb.length; k++) {
+        const w = nb[k];
+        if (!seen[w]) {
+          seen[w] = 1;
+          queue[tail++] = w;
+        }
+      }
+    }
+    if (tail < n) {
+      throw new TopologyError(
+        `检修替换预演失败：摘除链路 ${JSON.stringify(linkId)} 并试接临时备纤后余网仍不连通` +
+          `（仅 ${tail}/${n} 个站点可达），不能确认恢复连通`,
+      );
+    }
+
+    // 临时图生命周期隔离：独立 DFS 缓冲，复用同一份迭代式 Tarjan 判桥
+    const tempGraph: BridgeGraph = {
+      n,
+      adjTo,
+      adjEdge,
+      parentVertex: new Int32Array(n),
+      parentEdge: new Int32Array(n),
+      depth: new Int32Array(n),
+    };
+    const tj = tarjanBridges(tempGraph, m + 1);
+    const { isBridge, bridgeChild, subtree } = tj;
+
+    const baseBridge = new Set<number>();
+    for (let e = 0; e < m; e++) if (this.tj.isBridge[e]) baseBridge.add(e);
+
+    // 存活原链路按其原始编号 UTF-8 字节序归类输出（平行边各自独立判定）
+    const stillEdges: number[] = [];
+    const newEdges: number[] = [];
+    const clearedEdges: number[] = [];
+    for (let e = 0; e < m; e++) {
+      if (e === skip) continue;
+      if (isBridge[e]) {
+        (baseBridge.has(e) ? stillEdges : newEdges).push(e);
+      } else if (baseBridge.has(e)) {
+        clearedEdges.push(e);
+      }
+    }
+    const byId = (x: number, y: number): number => compareUtf8(this.g.linkIdByIndex[x], this.g.linkIdByIndex[y]);
+    stillEdges.sort(byId);
+    newEdges.sort(byId);
+    clearedEdges.sort(byId);
+
+    const toInfo = (e: number): BridgeInfo => {
+      const link = links[e];
+      const side = subtree[bridgeChild[e]];
+      return { id: link.id, u: link.u, v: link.v, smallerSide: Math.min(side, n - side) };
+    };
+    const stillBridges = stillEdges.map(toInfo);
+    const newBridges = newEdges.map(toInfo);
+    const clearedBridges = clearedEdges.map(toInfo);
+
+    const removedLinkInfo = links[skip];
+    const removedLink: RemovedMaintenanceLink = {
+      id: removedLinkInfo.id,
+      u: removedLinkInfo.u,
+      v: removedLinkInfo.v,
+      wasBaselineBridge: baseBridge.has(skip),
+    };
+    let tempSmaller = 0;
+    if (isBridge[tempEdge]) {
+      const side = subtree[bridgeChild[tempEdge]];
+      tempSmaller = Math.min(side, n - side);
+    }
+    const temporaryFiber: TemporaryBackupFiber = {
+      a,
+      b,
+      isBridge: isBridge[tempEdge] === 1,
+      smallerSide: tempSmaller,
+    };
+
+    return {
+      removedLink,
+      temporaryFiber,
+      stillBridges,
+      newBridges,
+      clearedBridges,
+      siteCount: n,
+      survivingLinkCount: m - 1,
+      baselineCount: this.baseline.bridges.length,
+    };
   }
 
   /**

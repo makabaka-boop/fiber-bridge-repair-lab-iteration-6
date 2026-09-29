@@ -5,6 +5,7 @@ import { TopologyError } from '../core/types';
 import type {
   BaselineResult,
   BatchScreenResult,
+  MaintenanceRehearsalResult,
   NormalizedTopology,
   OrderedPlanResult,
   QuotePlanResult,
@@ -48,6 +49,12 @@ interface QuoteState {
   error: string | null;
 }
 
+interface MaintenanceState {
+  /** 上次成功的检修替换预演结果；非法链路/端点或余网不连通时保留不变 */
+  result: MaintenanceRehearsalResult | null;
+  error: string | null;
+}
+
 export function App() {
   const [valid, setValid] = useState<ValidState | null>(null);
   const [rawText, setRawText] = useState('');
@@ -59,6 +66,7 @@ export function App() {
   const [batch, setBatch] = useState<BatchState | null>(null);
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [quote, setQuote] = useState<QuoteState | null>(null);
+  const [maintenance, setMaintenance] = useState<MaintenanceState | null>(null);
   /** 拓扑代次：每次成功导入递增，作废在途的异步复核回调，防止旧拓扑结果复活 */
   const topologyRev = useRef(0);
 
@@ -78,11 +86,13 @@ export function App() {
         });
         setImportError(null);
         setFileName(label);
-        // 新拓扑导入后旧试接、旧批量、旧有序计划与旧组合规划结果不再适用，清空（基线本身不受历史操作影响）
+        // 新拓扑导入后旧试接、旧批量、旧有序计划、旧组合规划与旧检修预演结果不再适用，清空
+        // （基线本身不受历史操作影响）
         setTrial(null);
         setBatch(null);
         setPlan(null);
         setQuote(null);
+        setMaintenance(null);
       } catch (e) {
         const msg = e instanceof TopologyError ? e.message : `分析失败：${(e as Error).message}`;
         setImportError(msg); // 保留 valid（上次有效拓扑）与既有试接/批量结果不变
@@ -182,6 +192,20 @@ export function App() {
     }
   };
 
+  const onMaintenance = (linkId: string, a: string, b: string) => {
+    if (!valid) return;
+    try {
+      // 按原始链路 ID 精确摘除 + 两个现有不同站点试接临时备纤；仅当余网恢复连通才生成结果
+      const result = valid.analyzer.rehearseReplacement(linkId, a, b);
+      // 合法新拓扑（指本次预演成功）才清空旧预演：整体替换上次结果
+      setMaintenance({ result, error: null });
+    } catch (e) {
+      const msg = e instanceof TopologyError ? e.message : `检修替换预演失败：${(e as Error).message}`;
+      // 非法链路/端点或余网不连通：只更新错误，保留上次成功预演，不改写任何其他区结果
+      setMaintenance((prev) => ({ result: prev?.result ?? null, error: msg }));
+    }
+  };
+
   return (
     <div className="app">
       <header className="topbar">
@@ -270,6 +294,12 @@ export function App() {
             quote={quote}
             onSubmit={onQuote}
             onDismissError={() => setQuote((p) => (p ? { ...p, error: null } : p))}
+          />
+          <MaintenanceSection
+            valid={valid}
+            maintenance={maintenance}
+            onSubmit={onMaintenance}
+            onDismissError={() => setMaintenance((p) => (p ? { ...p, error: null } : p))}
           />
         </>
       )}
@@ -804,6 +834,174 @@ function QuoteSection({
                 </table>
               </div>
               <Pagination page={covPage} total={result.coverage.length} />
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MaintenanceSection({
+  valid,
+  maintenance,
+  onSubmit,
+  onDismissError,
+}: {
+  valid: ValidState;
+  maintenance: MaintenanceState | null;
+  onSubmit: (linkId: string, a: string, b: string) => void;
+  onDismissError: () => void;
+}) {
+  const [linkId, setLinkId] = useState('');
+  const [a, setA] = useState('');
+  const [b, setB] = useState('');
+
+  // 仅当存在成功预演时展示；非法链路/端点或余网不连通时 result 保持为上次结果
+  const result = maintenance?.result ?? null;
+  const stillPage = usePagination(result?.stillBridges.length ?? 0, 'maint-still');
+  const newPage = usePagination(result?.newBridges.length ?? 0, 'maint-new');
+  const clearedPage = usePagination(result?.clearedBridges.length ?? 0, 'maint-cleared');
+
+  return (
+    <section className="card">
+      <h2>7. 检修替换预演</h2>
+      <p className="hint">
+        按<strong>原始链路 ID 精确摘除</strong>一条在役链路，再从现有站点选择两个不同端点试接一条临时备纤。
+        仅当替换后网络<strong>恢复连通</strong>才生成结果：列出<strong>仍为桥</strong>的原链路、
+        <strong>新变成桥</strong>的原链路，并<strong>单独说明临时备纤是否为桥</strong>。
+        被检修链路标记<strong>已移除</strong>，不算被备纤消除的风险；平行链路保持各自 ID 身份。
+        非法链路、端点或无法恢复连通的尝试只更新错误并保留上次成功预演，不改写原拓扑、基线与其他各区结果。
+      </p>
+      <div className="row trial-row">
+        <input
+          list="link-list"
+          className="endpoint"
+          placeholder="被摘除链路 ID（精确匹配）"
+          aria-label="被摘除链路 ID"
+          value={linkId}
+          onChange={(e) => setLinkId(e.target.value)}
+        />
+        <datalist id="link-list">
+          {valid.topology.links.slice(0, 2000).map((l) => (
+            <option key={l.id} value={l.id} />
+          ))}
+        </datalist>
+        <span className="dash">⇄</span>
+        <input
+          list="maint-site-list"
+          className="endpoint"
+          placeholder="临时备纤端点 A（站点编号）"
+          aria-label="临时备纤端点 A"
+          value={a}
+          onChange={(e) => setA(e.target.value)}
+        />
+        <span className="dash">⇄</span>
+        <input
+          list="maint-site-list"
+          className="endpoint"
+          placeholder="临时备纤端点 B（站点编号）"
+          aria-label="临时备纤端点 B"
+          value={b}
+          onChange={(e) => setB(e.target.value)}
+        />
+        <datalist id="maint-site-list">
+          {valid.topology.sites.slice(0, 2000).map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+        <button className="primary" onClick={() => onSubmit(linkId, a, b)}>
+          摘除并试接备纤
+        </button>
+      </div>
+      {valid.topology.sites.length > 2000 && (
+        <p className="hint">站点较多，输入框支持直接键入编号精确匹配（自动补全仅列前 2000 项）。</p>
+      )}
+
+      {maintenance?.error && (
+        <div className="alert error" role="alert">
+          <strong>检修替换预演被拒绝。</strong>{' '}
+          {result ? '上次成功预演结果保留如下。' : '尚无成功预演结果。'}
+          <div className="alert-detail">{maintenance.error}</div>
+          <button className="link" onClick={onDismissError}>
+            关闭提示
+          </button>
+        </div>
+      )}
+
+      {result && (
+        <div className="maintenance-result">
+          <div className="trial-head">
+            已移除链路 <code>{result.removedLink.id}</code>（{result.removedLink.u} <span className="dash">–</span>{' '}
+            {result.removedLink.v}）｜ 临时备纤 <code>{result.temporaryFiber.a}</code> ⇄{' '}
+            <code>{result.temporaryFiber.b}</code> ｜ 替换后网络已恢复连通（{result.siteCount} 个站点 /{' '}
+            {result.survivingLinkCount} 条存活原链路 + 1 条临时备纤）
+          </div>
+          <div className="stat-row">
+            <Stat label="仍为桥的原链路" value={result.stillBridges.length} />
+            <Stat label="新变成桥的原链路" value={result.newBridges.length} />
+            <Stat label="被备纤消除的原桥" value={result.clearedBridges.length} />
+            <Stat label="基线脆弱链路总数" value={result.baselineCount} />
+          </div>
+
+          <div
+            className={`alert ${result.temporaryFiber.isBridge ? 'error' : 'ok'}`}
+            role="status"
+          >
+            {result.temporaryFiber.isBridge ? (
+              <>
+                <strong>临时备纤是桥（新的单点故障）：</strong>一旦它断开，网络将分裂为两个连通块
+                （较小侧 {result.temporaryFiber.smallerSide.toLocaleString('zh-CN')} 个站点）。
+              </>
+            ) : (
+              <strong>临时备纤不是桥：它本身不构成单点故障。</strong>
+            )}
+          </div>
+
+          <div className="alert neutral">
+            被检修链路 <span className="mono">{result.removedLink.id}</span> 状态为<strong>已移除</strong>
+            {result.removedLink.wasBaselineBridge ? '（原基线桥，摘除后不计入被备纤消除的风险）' : '（原非桥）'}
+            ；平行链路按各自 ID 独立判定。
+          </div>
+
+          <h3 className="still">仍为桥的原链路（{result.stillBridges.length}）</h3>
+          {result.stillBridges.length === 0 ? (
+            <div className="alert ok">替换后没有原链路仍然是桥。</div>
+          ) : (
+            <>
+              <BridgeTable
+                rows={result.stillBridges.slice(stillPage.start, stillPage.end)}
+                offset={stillPage.start}
+                showSmallerSide
+              />
+              <Pagination page={stillPage} total={result.stillBridges.length} />
+            </>
+          )}
+
+          <h3 className="removed">新变成桥的原链路（{result.newBridges.length}）</h3>
+          {result.newBridges.length === 0 ? (
+            <div className="alert neutral">替换后没有原链路新变成桥。</div>
+          ) : (
+            <>
+              <BridgeTable
+                rows={result.newBridges.slice(newPage.start, newPage.end)}
+                offset={newPage.start}
+                showSmallerSide
+              />
+              <Pagination page={newPage} total={result.newBridges.length} />
+            </>
+          )}
+
+          <h3>被临时备纤消除的原桥（{result.clearedBridges.length}）</h3>
+          {result.clearedBridges.length === 0 ? (
+            <div className="alert neutral">临时备纤未消除任何基线桥（已移除链路不在此列）。</div>
+          ) : (
+            <>
+              <BridgeTable
+                rows={result.clearedBridges.slice(clearedPage.start, clearedPage.end)}
+                offset={clearedPage.start}
+              />
+              <Pagination page={clearedPage} total={result.clearedBridges.length} />
             </>
           )}
         </div>
