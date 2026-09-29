@@ -22,6 +22,8 @@ import type {
   BatchScreenResult,
   BridgeCoverageItem,
   BridgeInfo,
+  MaintenanceResult,
+  NormalizedLink,
   NormalizedTopology,
   OrderedPlanItem,
   OrderedPlanResult,
@@ -159,6 +161,56 @@ function tarjanBridges(g: PreparedGraph, m: number): TarjanOutput {
     }
   }
   return { isBridge, bridgeChild, subtree, order };
+}
+
+/**
+ * 隔离生命周期的临时图桥分析：给定一张临时拓扑（如摘除一条链路并接入
+ * 临时备纤后的图），**一次性**构建其专属邻接表并运行同一套 Tarjan 桥检测。
+ * 缓冲在调用栈内随用随弃，绝不触碰导入图的 PreparedGraph / TarjanOutput /
+ * LcaIndex，也不修改传入的拓扑。
+ *
+ * 返回：
+ *  - components：连通分量数（图必须连通才为 1，否则检修替换预演被拒绝）；
+ *  - bridgeInfoByTempIndex：临时链路下标 → 桥结论（含按临时图重算的较小侧），
+ *    非桥不在映射中；
+ *  - sortedBridgeTempEdges：桥的临时链路下标，按链路编号 UTF-8 字节序。
+ */
+function analyzeIsolatedGraph(t: NormalizedTopology): {
+  components: number;
+  bridgeInfoByTempIndex: Map<number, BridgeInfo>;
+  sortedBridgeTempEdges: Int32Array;
+} {
+  const m = t.links.length;
+  const g = prepare(t);
+  const tj = tarjanBridges(g, m);
+
+  // 连通分量数 = Tarjan 遍历的根数量；disconnected 时只用于判负，不再组装结果
+  let components = 0;
+  for (let i = 0; i < tj.order.length; i++) {
+    if (g.parentVertex[tj.order[i]] === -1) components++;
+  }
+
+  const bridgeInfoByTempIndex = new Map<number, BridgeInfo>();
+  const bridgeEdges: number[] = [];
+  for (let e = 0; e < m; e++) {
+    if (!tj.isBridge[e]) continue;
+    bridgeEdges.push(e);
+    const link = t.links[e];
+    const side = tj.subtree[tj.bridgeChild[e]];
+    bridgeInfoByTempIndex.set(e, {
+      id: link.id,
+      u: link.u,
+      v: link.v,
+      smallerSide: Math.min(side, g.n - side),
+    });
+  }
+  bridgeEdges.sort((x, y) => compareUtf8(g.linkIdByIndex[x], g.linkIdByIndex[y]));
+
+  return {
+    components,
+    bridgeInfoByTempIndex,
+    sortedBridgeTempEdges: Int32Array.from(bridgeEdges),
+  };
 }
 
 /**
@@ -728,6 +780,123 @@ export class Analyzer {
       candidateCount: count,
     };
   }
+
+  /**
+   * 检修替换预演：按原始链路编号精确摘除一条在役链路，再在两个现有且
+   * 不同的站点之间试接一条临时备纤，核对余网是否真正恢复连通，并定位
+   * 新的单点故障（桥）落点。
+   *
+   * 校验与生命周期：
+   *  - 链路编号沿用编号契约（非空字符串 / 十进制整数），逐字符精确匹配
+   *    原始链路；端点沿用单次试接规则，必须存在且互异；
+   *  - 平行链路各自保持 ID 身份：按 ID 只摘除被点名的那一条；
+   *  - 摘除后若余网已不连通（该链路本就是无热备的桥），或接入备纤后
+   *    仍无法恢复连通，抛 TopologyError，由调用方保留上次成功预演；
+   *  - 分析在一张隔离的临时图上复用现有桥检测，临时图缓冲随调用结束
+   *    即释放，绝不改写原拓扑、基线、单次试接、批量筛选、有序计划与报价；
+   *  - 仅替换后连通时才返回结果。
+   *
+   * 结论分类（临时图中的桥）：
+   *  - 被摘除链路标记“已移除”，**不算作被备纤消除的风险**，不出现在任何
+   *    桥清单中；
+   *  - 临时桥下标映射回原始链路：基线桥 → stillBridges（仍为桥），
+   *    原非桥 → newBridges（新变成桥）；
+   *  - 临时备纤单独以 temporaryIsBridge 说明。
+   */
+  rehearseMaintenance(rawLinkId: unknown, rawA: unknown, rawB: unknown): MaintenanceResult {
+    const linkId = normalizeMaintenanceId(rawLinkId);
+    let removedIndex = -1;
+    for (let e = 0; e < this.t.links.length; e++) {
+      if (this.g.linkIdByIndex[e] === linkId) {
+        removedIndex = e;
+        break;
+      }
+    }
+    if (removedIndex === -1) {
+      throw new TopologyError(`检修替换失败：被检修链路 ${JSON.stringify(linkId)} 不在当前链路清单中`);
+    }
+
+    const a = normalizeMaintenanceEndpoint(rawA, '备纤端点 A');
+    const b = normalizeMaintenanceEndpoint(rawB, '备纤端点 B');
+    if (a === b) {
+      throw new TopologyError(
+        `检修替换失败：两个备纤端点必须不同（均为 ${JSON.stringify(a)}），不得构成自环`,
+      );
+    }
+    const ia = this.g.siteIndex.get(a);
+    const ib = this.g.siteIndex.get(b);
+    if (ia === undefined || ib === undefined) {
+      const missing = ia === undefined ? a : b;
+      throw new TopologyError(`检修替换失败：备纤端点 ${JSON.stringify(missing)} 不在当前站点清单中`);
+    }
+
+    const removedLink = this.t.links[removedIndex];
+
+    // 构建临时图：保留除被摘除链路外的全部原始链路（平行边各自保持身份），
+    // 再追加一条临时备纤。
+    const tempLinks: NormalizedLink[] = new Array(this.t.links.length);
+    let k = 0;
+    for (let e = 0; e < this.t.links.length; e++) {
+      if (e !== removedIndex) tempLinks[k++] = this.t.links[e];
+    }
+    tempLinks.length = k;
+    // 内部临时链路编号保证不与任何导入编号（含含字符 U+E000 者）碰撞
+    const temporaryLinkId = this.mintTemporaryLinkId();
+    tempLinks.push({ id: temporaryLinkId, u: a, v: b });
+    const tempEdgeIndex = tempLinks.length - 1;
+
+    const tempTopology: NormalizedTopology = { sites: this.t.sites, links: tempLinks };
+    // 临时图隔离分析：缓冲随本次调用生死，不触碰导入图的任何分析状态
+    const { components, bridgeInfoByTempIndex, sortedBridgeTempEdges } = analyzeIsolatedGraph(tempTopology);
+    if (components !== 1) {
+      throw new TopologyError(
+        `检修替换失败：摘除链路 ${JSON.stringify(linkId)} 并以临时备纤 ${JSON.stringify(a)} ⇄ ${JSON.stringify(
+          b,
+        )} 试接后余网仍不连通（${components} 个连通块），未生成替换结果`,
+      );
+    }
+
+    const baselineBridgeIds = new Set<string>();
+    for (const info of this.baseline.bridges) baselineBridgeIds.add(info.id);
+
+    const stillBridges: BridgeInfo[] = [];
+    const newBridges: BridgeInfo[] = [];
+    for (const te of sortedBridgeTempEdges) {
+      if (te === tempEdgeIndex) continue; // 临时备纤单独说明
+      const info = bridgeInfoByTempIndex.get(te)!;
+      // 被摘除链路不在临时图中，天然不会进入任一清单（也不算“已消除”）
+      (baselineBridgeIds.has(info.id) ? stillBridges : newBridges).push(info);
+    }
+
+    return {
+      removedLink: { id: removedLink.id, u: removedLink.u, v: removedLink.v, status: 'removed' },
+      a,
+      b,
+      temporaryLinkId,
+      stillBridges,
+      newBridges,
+      temporaryIsBridge: bridgeInfoByTempIndex.has(tempEdgeIndex),
+      baselineCount: this.baseline.bridges.length,
+    };
+  }
+
+  /**
+   * 生成内部临时链路编号：以私用区字符 U+E000 为基底（正常导入几乎不会
+   * 出现），并在已导入编号集合中碰撞时追加序号，保证内部编号绝不与任何
+   * 导入编号碰撞。
+   */
+  private mintTemporaryLinkId(): string {
+    const base = '检修临时备纤';
+    let candidate = `${base}#0`;
+    let seq = 0;
+    const existing = this.g.linkIdByIndex;
+    // 线性探测碰撞（实际几乎不发生）；用集合式扫描保证语义正确
+    while (existing.some((id) => id === candidate)) {
+      seq++;
+      candidate = `${base}#${seq}`;
+    }
+    return candidate;
+  }
 }
 
 /**
@@ -745,4 +914,36 @@ function normalizeEndpoint(value: unknown, label: string): string {
     return String(value);
   }
   throw new TopologyError(`试接失败：${label}必须是已存在的站点编号`);
+}
+
+/**
+ * 检修替换的被检修链路编号规范化：字符串逐字符原样保留（首尾空白是链路
+ * 编号的合法组成部分），仅空串拒绝；安全整数按其十进制文本承载。
+ * 与导入层 normalizeId 同一条身份规则。
+ */
+function normalizeMaintenanceId(value: unknown): string {
+  if (typeof value === 'string') {
+    if (value.length === 0) throw new TopologyError('检修替换失败：被检修链路编号不能为空字符串');
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value)) {
+    return String(value);
+  }
+  throw new TopologyError('检修替换失败：被检修链路编号必须是非空字符串或整数链路编号');
+}
+
+/**
+ * 检修替换的备纤端点规范化：规则与单次试接完全一致——字符串逐字符原样
+ * 保留（首尾空白有意义），安全整数按十进制文本承载，其余类型拒绝；
+ * 端点存在性随后在 siteIndex 中逐字符精确匹配。
+ */
+function normalizeMaintenanceEndpoint(value: unknown, label: string): string {
+  if (typeof value === 'string') {
+    if (value.length === 0) throw new TopologyError(`检修替换失败：${label}不能为空字符串`);
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value)) {
+    return String(value);
+  }
+  throw new TopologyError(`检修替换失败：${label}必须是已存在的站点编号`);
 }

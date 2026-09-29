@@ -382,6 +382,22 @@ h3.removed {
   color: var(--removed);
 }
 
+.tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+  margin: 0 2px;
+}
+
+.removed-tag {
+  background: color-mix(in srgb, var(--removed) 16%, transparent);
+  color: var(--removed);
+  border: 1px solid color-mix(in srgb, var(--removed) 45%, transparent);
+}
+
 .empty {
   text-align: center;
   color: var(--muted);

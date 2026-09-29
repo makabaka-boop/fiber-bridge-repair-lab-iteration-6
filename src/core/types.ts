@@ -155,6 +155,42 @@ export interface TrialResult {
   baselineCount: number;
 }
 
+/** 检修替换预演中被摘除的原始链路（标记为“已移除”，不参与替换后桥判定） */
+export interface RemovedLinkInfo {
+  /** 原始链路编号（精确匹配导入编号，平行链路各自保持身份） */
+  id: string;
+  u: string;
+  v: string;
+  /** 固定状态：已移除 */
+  status: 'removed';
+}
+
+/**
+ * 检修替换预演结论：按原始链路编号精确摘除一条在役链路，再在两个现有且
+ * 不同的站点之间试接一条临时备纤；仅当替换后网络连通时才生成本结果。
+ *
+ * 生命周期隔离：替换分析在一张**临时图**上复用现有桥检测完成，绝不改写
+ * 原拓扑、基线、单次试接、批量筛选、有序计划与报价结果；被摘除的链路
+ * 标记为“已移除”，**不算作被备纤消除的风险**。
+ */
+export interface MaintenanceResult {
+  /** 被精确摘除的原始链路（已移除） */
+  removedLink: RemovedLinkInfo;
+  /** 临时备纤端点 */
+  a: string;
+  b: string;
+  /** 临时备纤在本次临时图内部使用的链路编号（保证不与任何导入编号碰撞） */
+  temporaryLinkId: string;
+  /** 替换后仍为桥的**原始**链路（不含已移除链路，按编号 UTF-8 字节序） */
+  stillBridges: BridgeInfo[];
+  /** 替换后新变成桥的**原始**链路（原非桥，按编号 UTF-8 字节序） */
+  newBridges: BridgeInfo[];
+  /** 临时备纤自身在替换后网络中是否为桥（单独判定，不计入原始链路清单） */
+  temporaryIsBridge: boolean;
+  /** 基线脆弱链路总数（快照） */
+  baselineCount: number;
+}
+
 /** 解析/分析失败时抛出的错误，消息可直接展示给工程师 */
 export class TopologyError extends Error {
   constructor(message: string) {

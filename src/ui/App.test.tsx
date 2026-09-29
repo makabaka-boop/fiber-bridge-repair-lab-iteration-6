@@ -21,6 +21,10 @@ const planBox = () => screen.getByLabelText('有序备纤计划 JSON 输入') as
 const planButton = () => screen.getByRole('button', { name: '按序复核' });
 const quoteBox = () => screen.getByLabelText('备纤报价 JSON 输入') as HTMLTextAreaElement;
 const quoteButton = () => screen.getByRole('button', { name: '求解最低总价组合' });
+const maintenanceLinkBox = () => screen.getByLabelText('被检修链路编号输入') as HTMLInputElement;
+const maintenanceA = () => screen.getByLabelText('检修备纤端点 A 输入') as HTMLInputElement;
+const maintenanceB = () => screen.getByLabelText('检修备纤端点 B 输入') as HTMLInputElement;
+const maintenanceButton = () => screen.getByRole('button', { name: '摘除并试接预演' });
 
 /** 读取“脆弱链路总数”统计卡数值（该卡始终随基线渲染，非法导入后也保留） */
 const fragileStatValue = () => {
@@ -86,6 +90,27 @@ async function submitQuote(text: string) {
   await waitFor(() => expect(quoteBox().value).toBe(text));
   fireEvent.click(quoteButton());
 }
+
+async function submitMaintenance(linkId: string, a: string, b: string) {
+  fireEvent.change(maintenanceLinkBox(), { target: { value: linkId } });
+  fireEvent.change(maintenanceA(), { target: { value: a } });
+  fireEvent.change(maintenanceB(), { target: { value: b } });
+  await waitFor(() => {
+    expect(maintenanceLinkBox().value).toBe(linkId);
+    expect(maintenanceA().value).toBe(a);
+    expect(maintenanceB().value).toBe(b);
+  });
+  fireEvent.click(maintenanceButton());
+}
+
+/** 检修替换预演区内指定 h3 标题之后的桥表文本（同名统计卡标签需排除） */
+const maintenanceTableAfter = (re: RegExp) => {
+  const section = screen.getByText('7. 检修替换预演').closest('section') as HTMLElement;
+  const h = Array.from(section.querySelectorAll('h3')).find((el) => re.test(el.textContent ?? '')) as HTMLElement;
+  let node: Element | null = h.nextElementSibling;
+  while (node && !node.querySelector('table')) node = node.nextElementSibling;
+  return node?.textContent ?? '';
+};
 
 /** 第 6 区（最低总价备纤组合）的卡片，统计卡查询限定在本区内避免同名卡歧义 */
 const quoteSection = () =>
@@ -710,5 +735,127 @@ describe('最低总价备纤组合 UI', () => {
     expect(screen.getByText(/已消除 2 条/)).toBeTruthy();
     expect(batchRows()).toHaveLength(1);
     expect(planRows()).toHaveLength(1);
+  });
+});
+
+describe('检修替换预演 UI', () => {
+  /**
+   * a-b 双平行链路 p1/p2（热备，均非桥）＋ 桥 tail(b-c)。
+   * 摘除一条平行边后，另一条以自身 ID 成为新桥。
+   */
+  const parallelJson = JSON.stringify({
+    sites: ['a', 'b', 'c'],
+    links: [
+      { id: 'p1', u: 'a', v: 'b' },
+      { id: 'p2', u: 'a', v: 'b' },
+      { id: 'tail', u: 'b', v: 'c' },
+    ],
+  });
+
+  it('摘除平行边后按原 ID 列新桥，被摘除链路标记已移除；备纤为桥单独说明', async () => {
+    render(<App />);
+    await importJson(parallelJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('1'));
+
+    // 摘除 p1，备纤 b-c（与 tail 平行）：p2 新成桥；tail 被消除；备纤非桥
+    await submitMaintenance('p1', 'b', 'c');
+    await waitFor(() => expect(screen.getByText(/替换后网络已恢复连通/)).toBeTruthy());
+
+    const section = screen.getByText('7. 检修替换预演').closest('section') as HTMLElement;
+    // 被摘除链路显示“已移除”标记
+    expect(section.textContent).toContain('p1');
+    expect(within(section).getByText('已移除', { selector: '.removed-tag' })).toBeTruthy();
+    // 新变成桥为 p2（保持自身 ID，不与 p1 混淆）
+    expect(maintenanceTableAfter(/新变成桥的原链路/)).toContain('p2');
+    expect(maintenanceTableAfter(/新变成桥的原链路/)).not.toContain('tail');
+    // 仍为桥为空；被摘除的 p1 不出现在任一桥清单
+    expect(within(section).getByText(/没有任何原链路仍是单点故障/)).toBeTruthy();
+    // 临时备纤非桥
+    expect(section.textContent).toContain('临时备纤不是桥');
+
+    // 统计卡：基线 1、仍为桥 0、新成桥 1
+    const maintStat = (label: string) =>
+      within(section).getByText(label).closest('.stat')?.querySelector('.stat-value')?.textContent;
+    expect(maintStat('基线脆弱链路总数')).toBe('1');
+    expect(maintStat('替换后仍为桥的原链路')).toBe('0');
+    expect(maintStat('新变成桥的原链路')).toBe('1');
+  });
+
+  it('无法恢复连通 / 无效链路 / 无效端点只更新错误并保留上次成功预演', async () => {
+    render(<App />);
+    await importJson(validJson); // a-b(L1)-c(L2)，均为桥
+    await waitFor(() => expect(fragileStatValue()).toBe('2'));
+
+    // 先有一次成功预演：摘除 L1，备纤 a-b（补回原桥位置），余网连通
+    await submitMaintenance('L1', 'a', 'b');
+    await waitFor(() => expect(screen.getByText(/替换后网络已恢复连通/)).toBeTruthy());
+    const section = () => screen.getByText('7. 检修替换预演').closest('section') as HTMLElement;
+    expect(section().textContent).toContain('临时备纤是替换后网络的单点故障');
+
+    // 摘除 L2（c 的唯一链路），备纤不涉及 c（a-b）：余网仍不连通 → 拒绝，保留上次结果
+    await submitMaintenance('L2', 'a', 'b');
+    await waitFor(() => expect(screen.getByText('检修替换预演被拒绝。')).toBeTruthy());
+    expect(screen.getByText(/余网仍不连通/)).toBeTruthy();
+    // 上次成功预演（L1）仍在
+    expect(section().textContent).toContain('L1');
+    expect(section().textContent).toContain('已移除');
+
+    // 无效链路编号：只更新错误，结果保留
+    await submitMaintenance('ghost', 'a', 'b');
+    await waitFor(() => expect(screen.getByText(/不在当前链路清单/)).toBeTruthy());
+    expect(section().textContent).toContain('L1');
+
+    // 无效端点（不存在 / 相同）：只更新错误，结果保留
+    await submitMaintenance('L1', 'a', 'ghost');
+    await waitFor(() => expect(screen.getByText(/不在当前站点清单/)).toBeTruthy());
+    expect(section().textContent).toContain('L1');
+    await submitMaintenance('L1', 'b', 'b');
+    await waitFor(() => expect(screen.getByText(/两个备纤端点必须不同/)).toBeTruthy());
+    expect(section().textContent).toContain('L1');
+  });
+
+  it('检修预演不改写基线与其他各区结果；合法新拓扑清空旧预演', async () => {
+    render(<App />);
+    await importJson(parallelJson);
+    await waitFor(() => expect(fragileStatValue()).toBe('1'));
+
+    // 其他各区先产出结果
+    await submitTrial('a', 'c');
+    await waitFor(() => expect(screen.getByText(/已消除 1 条/)).toBeTruthy());
+    await submitBatch('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(batchRows()).toHaveLength(1));
+    await submitPlan('[{"a":"a","b":"c"}]');
+    await waitFor(() => expect(planRows()).toHaveLength(1));
+
+    // 检修预演
+    await submitMaintenance('p1', 'b', 'c');
+    await waitFor(() => expect(screen.getByText(/替换后网络已恢复连通/)).toBeTruthy());
+
+    // 基线、试接、批量、有序计划原样保留
+    expect(fragileStatValue()).toBe('1');
+    expect(screen.getByText(/已消除 1 条/)).toBeTruthy();
+    expect(batchRows()).toHaveLength(1);
+    expect(planRows()).toHaveLength(1);
+
+    // 合法新拓扑（三角形，无桥）：旧预演与各区结果一并清空
+    await importJson(
+      JSON.stringify({
+        sites: ['x', 'y', 'z'],
+        links: [
+          { id: 'r1', u: 'x', v: 'y' },
+          { id: 'r2', u: 'y', v: 'z' },
+          { id: 'r3', u: 'z', v: 'x' },
+        ],
+      }),
+    );
+    await waitFor(() => expect(fragileStatValue()).toBe('0'));
+    const section = screen.getByText('7. 检修替换预演').closest('section') as HTMLElement;
+    expect(section.textContent).not.toContain('替换后网络已恢复连通');
+    expect(section.textContent).not.toContain('p1');
+
+    // 非法导入：继续保留当前拓扑（无桥三角形）
+    await importJson('{坏的');
+    await waitFor(() => expect(screen.getByText('导入被拒绝，')).toBeTruthy());
+    expect(fragileStatValue()).toBe('0');
   });
 });

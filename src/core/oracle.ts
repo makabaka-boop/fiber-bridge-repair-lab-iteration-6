@@ -108,3 +108,68 @@ export function oracleTrial(
   void virtual;
   return { stillFragile, removed };
 }
+
+/**
+ * 删边预言机校验“检修替换预演”：先按链路编号精确摘除 removedId，
+ * 再追加一条临时备纤 (a,b)，在得到的临时图上**逐边删除**判定桥。
+ *
+ * 独立于生产实现：临时链路编号由调用方给出（核对其不与导入编号碰撞），
+ * 预言机完全按边的下标工作，不复用 Analyzer 的任何索引。
+ *
+ * 返回：
+ *  - connected：替换后的图是否连通（不连通时生产侧必须拒绝、不产出结果）；
+ *  - bridgeIds：替换后图中的全部桥编号集合（含临时备纤编号）；
+ *  - edgeIds：临时图中除被摘除链路外的原始链路编号（按下标序），
+ *    供测试映射“仍为桥 / 新变成桥”。
+ */
+export function oracleReplacement(
+  t: NormalizedTopology,
+  removedId: string,
+  a: string,
+  b: string,
+  temporaryId: string,
+): { connected: boolean; bridgeIds: Set<string>; edgeIds: string[] } {
+  const n = t.sites.length;
+  const index = new Map<string, number>();
+  t.sites.forEach((s, i) => index.set(s, i));
+
+  const removedIndex = t.links.findIndex((l) => l.id === removedId);
+  if (removedIndex === -1) throw new Error(`oracle：链路 ${removedId} 不存在`);
+
+  const kept = t.links.filter((_, e) => e !== removedIndex);
+  const edges = kept.map((l) => [index.get(l.u)!, index.get(l.v)!] as const);
+  edges.push([index.get(a)!, index.get(b)!]);
+  const edgeIds = [...kept.map((l) => l.id), temporaryId];
+
+  const reachable = (skip: number): number => {
+    const seen = new Uint8Array(n);
+    const queue = new Int32Array(n);
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = 0;
+    seen[0] = 1;
+    while (head < tail) {
+      const v = queue[head++];
+      for (let e = 0; e < edges.length; e++) {
+        if (e === skip) continue;
+        const [p, q] = edges[e];
+        let w = -1;
+        if (p === v) w = q;
+        else if (q === v) w = p;
+        if (w !== -1 && !seen[w]) {
+          seen[w] = 1;
+          queue[tail++] = w;
+        }
+      }
+    }
+    return tail;
+  };
+
+  // 不删任何边先确认替换图整体连通
+  const connected = reachable(-1) === n;
+  const bridgeIds = new Set<string>();
+  for (let e = 0; e < edges.length; e++) {
+    if (reachable(e) < n) bridgeIds.add(edgeIds[e]);
+  }
+  return { connected, bridgeIds, edgeIds };
+}
